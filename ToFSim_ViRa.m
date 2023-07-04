@@ -1,0 +1,285 @@
+clear all;
+close all;
+
+% set(0,'DefaultFigureWindowStyle','docked')
+
+
+% Simulation Parameters
+NrPixel_x = 600;
+NrPixel_y = 342;
+farclip = 20;
+nearclip = 0.1;
+mod_f = 20e6;
+fov_vertical = 45;
+fov_horizontal = 72;
+
+
+amplitude_treshhold = 0.025; % 1 corresponds to saturated illumination
+amplitude_saturation_treshhold = 3;
+noise_level = 0.01;
+
+c0 = 300e6;
+samplesNumber = 512;
+chirpsNumber = 4;
+fs = 2e6;
+bandwidth = 6e9;%6e9
+LowerChirpFrequency = 57e9;%57e9
+ChirpRate = (bandwidth *fs) /samplesNumber;
+mask = ones(NrPixel_y, NrPixel_x);
+
+Tc = samplesNumber/fs;
+K = bandwidth/Tc;
+xscale  = 2*K /c0;  
+Zeropad = 2*2^(nextpow2(samplesNumber)); 
+Zeropad_velocity = Zeropad/2;
+
+range_axis  = linspace(0,1-1/Zeropad,Zeropad)*fs/xscale;   
+
+% lambda = c0/60e9;           % wavelength
+lambda = c0/LowerChirpFrequency;           % wavelength
+spacing = lambda/2;  % spacing between receivers
+
+Max_vel = lambda/(4*Tc);
+vel_res = lambda/(2*chirpsNumber*Tc);
+vel_axis = linspace(-Max_vel/2, Max_vel/2, Zeropad_velocity + 1); 
+
+
+just_once = 0;
+
+bytes_to_receive =  3 * 4 * NrPixel_x * NrPixel_y; % max bytes to receive in case of two 32-bit color channels
+% setup tcpip socket
+tcpipClient = tcpip('127.0.0.1',8052,'NetworkRole','Client');
+set(tcpipClient,'Timeout',10);
+tcpipClient.InputBufferSize = bytes_to_receive;
+
+fopen(tcpipClient);
+
+rawData = [];
+a=12345
+
+sweep_data = [];
+
+plot_active = true;
+h = figure;
+tStart = tic;  
+time = 0;
+
+r = rateControl(0.667);
+reset(r);
+count = 1;
+
+
+% Radar stuff that can stay outside:
+n_guard = 8;
+n_cell = 20;
+n_tot = n_guard + n_cell;
+cfar = phased.CFARDetector('NumTrainingCells',n_cell,'NumGuardCells',n_guard);
+cfar.Method = 'OS';
+cfar.Rank = floor(n_cell*3/4);
+exp_pfa = 1e-4;
+% cfar.ThresholdFactor = 'Auto';
+cfar.ProbabilityFalseAlarm = exp_pfa;
+release(cfar);
+cfar.ThresholdFactor = 'Custom';
+cfar.CustomThresholdFactor = 2.25; 
+
+Hann_window_tr = hann(samplesNumber,'periodic');                                                  
+ScaleHannWin_tr = 1/sum(Hann_window_tr);  
+Cheb_window_tr = chebwin(chirpsNumber ,80);                                               
+ScaleChebWin_tr = 1/sum(Cheb_window_tr );
+
+while 1
+
+tic
+    fwrite(tcpipClient,'READY');
+
+
+    image_length = fread(tcpipClient, 4); %read length of image to be send
+    len = (typecast(uint8(image_length)','int32')); 
+    
+     rawData = fread(tcpipClient, double(len)); %read image bytes in png format
+
+    rawData_uint = uint8(rawData);                      %// cast them to "uint8" if they are not already
+    rawData_float = typecast( fliplr(rawData_uint) , 'single');
+    raw_Data_double = double(rawData_float);
+
+    R = raw_Data_double(1:3:end-1);
+    R = reshape(R, NrPixel_x, NrPixel_y);
+    R = R';
+    amplitude = R(end:-1:1,:);
+  
+    G = raw_Data_double(2:3:end-1);
+    G = reshape(G, NrPixel_x, NrPixel_y);
+    G = G';
+    depth = G(end:-1:1,:);
+    
+    time_stamp = raw_Data_double(end);
+ 
+    
+    B = raw_Data_double(3:3:end);
+    B = reshape(B, NrPixel_x, NrPixel_y);
+    B = B';
+    amplitude_radar = B(end:-1:1,:);
+
+    
+    figure(99)
+    clf
+    imagesc(depth)
+
+%     figure(1)
+%     clf
+%     imagesc(amplitude_radar)
+
+   %% ToF
+    fov_horizontal_ToF = 56.2;
+    fov_vertical_ToF = 44;
+    trans_vec_ToF = [0,0,0]; % has to be 0 for ToF
+    [radial_dist_cut_ToF, intensity_cut_ToF] = transform_and_cut(amplitude,depth,trans_vec_ToF,fov_horizontal, fov_horizontal_ToF, fov_vertical, fov_vertical_ToF);
+    intensity_cut_ToF(isnan(intensity_cut_ToF)) = 0;
+    radial_dist_cut_ToF(isnan(radial_dist_cut_ToF)) = 0;
+    radial_dist_cut_ToF = radial_dist_cut_ToF./2;
+
+    [radial_dist_ToF_estimate] = depth_estimator(intensity_cut_ToF, radial_dist_cut_ToF, mod_f, noise_level, amplitude_treshhold, amplitude_saturation_treshhold);
+    %%
+    
+   
+
+
+
+    %% Radar creation and processing
+    fov_horizontal_radar = 72; % two-sided
+    fov_vertical_radar = 30; % two-sided
+    trans_vec_radar1 = [0,0,0]; % Translation between ToF frame and Tx/Rx1 radar frame. Assume no rotation
+    [radial_dist_cut_radar1, intensity_cut_radar1] = transform_and_cut(amplitude_radar,depth,trans_vec_radar1,fov_horizontal, fov_horizontal_radar, fov_vertical, fov_vertical_radar);
+    
+    trans_vec_radar2 = [spacing,0,0]; % Translation between Rx1 and Rx2. Assume no rotation
+    %consider having a slightly different version for the antennas ->
+    %faster
+    [radial_dist_cut_radar2, intensity_cut_radar2] = transform_and_cut(amplitude_radar,depth,trans_vec_radar2,fov_horizontal, fov_horizontal_radar, fov_vertical, fov_vertical_radar);
+    
+    
+%     delta_t = 1.5; % Adjust!!!
+    if(just_once == 0)
+        % initialize previous distance for velocity computation
+        average_prev_dist_1 = radial_dist_cut_radar1./2;
+        average_prev_dist_2 = radial_dist_cut_radar2./2;
+        
+        just_once=1;
+    end
+    
+    delta_t = toc(tStart);
+    tStart = tic;
+    average_dist_1 = radial_dist_cut_radar1./2;   
+    average_dist_2 = radial_dist_cut_radar2./2;
+    
+    [radar1] = ViRa_estimator(intensity_cut_radar1, average_dist_1, average_prev_dist_1, delta_t, c0, samplesNumber, chirpsNumber,fs, LowerChirpFrequency, ChirpRate ); 
+    [radar2] = ViRa_estimator(intensity_cut_radar2, average_dist_2,average_prev_dist_2, delta_t, c0, samplesNumber, chirpsNumber,fs, LowerChirpFrequency, ChirpRate );
+
+    radar1 = radar1 + 0.2*randn([chirpsNumber,length(radar1)]);
+    radar2 = radar2 + 0.2*randn([chirpsNumber,length(radar1)]);
+    average_prev_dist_1 = average_dist_1;
+    average_prev_dist_2 = average_dist_2;
+
+   %% Range
+   FFT_data_tr(:,:,1) = fft(radar1.*Hann_window_tr',Zeropad,2); 
+   FFT_data_tr(:,:,2) = fft(radar2.*Hann_window_tr',Zeropad,2);
+   FFT_mags_tr(:,:,:) = abs(FFT_data_tr(:,1:length(range_axis),:)).*ScaleHannWin_tr;  % let's use linear, not dB   
+   
+    % Range-FFT
+    FFT_mags_mean_tr = abs(mean(FFT_data_tr,1)); %mean of all chirps
+    FFT_to_use = FFT_mags_mean_tr(:,:,1); %use antenna 1 for CFAR / peak detection
+    FFT_to_use = FFT_to_use;
+    % FFT_to_check_filter = FFT_mags_mean_tr(:,:,2);
+
+%     Plot Range FFT
+%         figure(hTime)
+%         clf
+%         plot(range_axis(1:end/2), (FFT_to_use(1:end/2)));
+%         ylim([-20,20])
+%         xlim([0,3])
+%         drawnow
+
+    % CFAR / Peak detection
+    x_detected = [];
+    ii = 1:length(FFT_to_use(1:end/2))-n_tot;
+    x_detected(ii) = cfar(FFT_to_use(1:end/2)',ii+n_tot/2);
+    x_detected = [zeros(1,n_tot/2), x_detected, zeros(1,n_tot/2)];
+    idxs_from_cfar = find(x_detected);
+
+    figure(1),
+    clf
+    plot(range_axis(1:end/2), (FFT_to_use(1:end/2)))
+    hold on,
+    plot(range_axis(idxs_from_cfar),squeeze(FFT_to_use(idxs_from_cfar)), 'o');
+%     hold on
+%     plot(range_axis(1:end/2), (FFT_to_check_filter(1:end/2)), 'r')
+%     ylim([0,0.15])
+    ylim([0,100])
+    drawnow
+
+    Ranges = [];
+    Ranges = range_axis(idxs_from_cfar);
+    %% Angle
+    Horiz_info = [mean(FFT_data_tr(:,:,1))' mean(FFT_data_tr(:,:,2))']; %2 3 other
+    Angles_of_arrival = [];
+    for kk = 1:length(idxs_from_cfar)
+           rvPh(kk,:) = unwrap(angle(Horiz_info(idxs_from_cfar(kk),:)),[]); 
+           rvPhDelt(kk) = diff(rvPh(kk,:));                                        % get phase difference between the two receivers
+           Angles_of_arrival(kk) = asind((rvPhDelt(kk)/(2*pi))*(lambda/spacing));
+    end
+    Angles_of_arrival = Angles_of_arrival; %adjust for plotting
+    % Angles_of_arrival
+
+    %% Velocity
+    jj = 1:Zeropad/2;
+    doppler_FFT_mags(jj,:) = abs(fftshift(fft(FFT_data_tr(:,jj,1)',Zeropad_velocity+1,2)));
+    Velocities = [];
+    for kk = 1:length(idxs_from_cfar)
+        [rvPksvel,rvLocsvel] = findpeaks(doppler_FFT_mags(idxs_from_cfar(kk),:),'MINPEAKHEIGHT', ...
+                                      0.99*max(doppler_FFT_mags(idxs_from_cfar(kk),:)),'MinPeakDistance',5); % this should get always only 1 peak
+        if ~isempty(rvLocsvel)
+            Velocities(kk)= -vel_axis(rvLocsvel(1));  %pretty useless
+        end
+    end
+    % figure(2)
+    % clf
+    % plot(vel_axis, doppler_FFT_mags(idxs_from_cfar,:))
+    % drawnow
+
+%     Velocities
+
+%
+% figure(69)
+% clf
+% imagesc(radial_dist_ToF_estimate)
+% drawnow
+
+
+        figure(10)
+
+         clf     
+polarplot(deg2rad(Angles_of_arrival),Ranges, 'ro');
+
+thetalim([-60, 60]);
+rlim([0,5]);
+ax = gca;
+ax.ThetaZeroLocation = 'top';
+ax.ThetaDir = 'clockwise';
+%     legend('show')
+%     pause(0.01)
+drawnow
+
+%  
+    count = count+1;
+%     waitfor(r);
+toc
+
+end
+fclose(tcpipClient);
+
+
+
+
+
+
+
